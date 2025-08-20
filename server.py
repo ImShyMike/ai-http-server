@@ -1,7 +1,9 @@
 import asyncio
 import os
 import re
+import time
 from pathlib import Path
+from typing import Dict
 
 import aiohttp
 from dotenv import load_dotenv
@@ -52,13 +54,18 @@ TECHNICAL REQUIREMENTS:
 - NEVER utilize placeholders or TODOs - complete all code fully
 """
 
-IP, PORT = "0.0.0.0", 8000
-RATELIMITE_TABLE = []
-SITEMAP = []
-GENERATED_FILES_PATH = Path("generated")
+IP: str = "0.0.0.0"
+PORT: int = 8000
+RATELIMIT_TABLE: Dict[str, float] = {}  # {ip: timestamp}
+SITEMAP: Dict[str, float] = {}  # {path: timestamp}
+GENERATED_FILES_PATH: Path = Path("generated")
+
+RATELIMIT_EXPIRY: int = 1
+ENDPOINT_EXPIRY: int = 300
 
 
 async def get_response(prompt: str) -> dict:
+    """Get a response from the AI server using the provided prompt"""
     try:
         async with aiohttp.ClientSession() as session:
             payload = {
@@ -84,20 +91,38 @@ async def get_response(prompt: str) -> dict:
         return {"error": str(e)}
 
 
-async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+def cleanup_expired_entries() -> None:
+    """Remove expired rate limits and cached files"""
+    current_time = time.time()
+
+    expired_ips = [
+        ip
+        for ip, timestamp in RATELIMIT_TABLE.items()
+        if current_time - timestamp > RATELIMIT_EXPIRY
+    ]
+    for ip in expired_ips:
+        del RATELIMIT_TABLE[ip]
+
+    expired_paths = [
+        path
+        for path, timestamp in SITEMAP.items()
+        if current_time - timestamp > ENDPOINT_EXPIRY
+    ]
+    for path in expired_paths:
+        del SITEMAP[path]
+        file_path = GENERATED_FILES_PATH / Path(path)
+        if file_path.is_file():
+            file_path.unlink()
+            print(f"Expired file removed: {file_path}")
+
+
+async def handle_client(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+) -> None:
     addr = writer.get_extra_info("peername")[0]
     print(f"Connection from {addr}")
 
-    if addr in RATELIMITE_TABLE:
-        print(f"Rate limit exceeded for {addr}. Closing connection.")
-        response = "HTTP/1.1 429 Too Many Requests\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nRatelimit exceeded. Please try again later."
-        writer.write(response.encode("utf-8"))
-        await writer.drain()
-        writer.close()
-        await writer.wait_closed()
-        return
-
-    RATELIMITE_TABLE.append(addr)
+    cleanup_expired_entries()
 
     buffer = ""
     while "\r\n\r\n" not in buffer:
@@ -122,9 +147,23 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
     response = None
     true_path = first_line.split(" ")[1]
     path = true_path.lstrip("/").replace("/", "|")
-    if true_path == "/" or path not in SITEMAP:
-        SITEMAP.append(path)
+
+    needs_generation = true_path == "/" or path not in SITEMAP
+
+    if needs_generation and addr in RATELIMIT_TABLE:
+        print(f"Rate limit exceeded for {addr}. Closing connection.")
+        response = "HTTP/1.1 429 Too Many Requests\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nRatelimit exceeded. Please try again later."
+        writer.write(response.encode("utf-8"))
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+        return
+
+    if needs_generation:
+        RATELIMIT_TABLE[addr] = time.time()
+
         print(f"New endpoint added to sitemap: {path}")
+        SITEMAP[path] = time.time()
 
         response = (
             (await get_response(buffer))
@@ -132,6 +171,17 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             .get("message", {})
             .get("content", "")
         )
+
+        # hotfix for thinking models
+        try:
+            response = (
+                re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL)
+                if response
+                else ""
+            )
+            response = response.replace("```", "").strip()
+        except IndexError:
+            print(f"Error extracting response from: {response}")
 
         if true_path != "/":
             file_path = GENERATED_FILES_PATH / Path(path)
@@ -162,7 +212,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
     await writer.wait_closed()
 
 
-async def run_server():
+async def run_server() -> None:
     server = await asyncio.start_server(handle_client, IP, PORT)
     addrs = ", ".join(
         [f"{sock.getsockname()[0]}:{sock.getsockname()[1]}" for sock in server.sockets]
@@ -172,24 +222,7 @@ async def run_server():
         await server.serve_forever()
 
 
-async def clear_rate_limit_table():
-    while True:
-        await asyncio.sleep(3)
-        RATELIMITE_TABLE.clear()
-
-
-async def clear_generated_endpoints():
-    global SITEMAP
-    while True:
-        await asyncio.sleep(5 * 60)
-        SITEMAP.clear()
-        for file in GENERATED_FILES_PATH.glob("**/*"):
-            if file.is_file():
-                file.unlink()
-        print("Sitemap cleared.")
-
-
-async def main():
+async def main() -> None:
     if not GENERATED_FILES_PATH.exists():
         GENERATED_FILES_PATH.mkdir(parents=True, exist_ok=True)
 
@@ -197,8 +230,6 @@ async def main():
         if file.is_file():
             file.unlink()
 
-    asyncio.create_task(clear_rate_limit_table())
-    asyncio.create_task(clear_generated_endpoints())
     print("Starting AI HTTP Server...")
     await run_server()
 
