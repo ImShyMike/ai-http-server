@@ -183,6 +183,9 @@ async def handle_client(
         except IndexError:
             print(f"Error extracting response from: {response}")
 
+        if response.startswith("http"):
+            response = response.split("HTTP", 1)[1]
+
         if true_path != "/":
             file_path = GENERATED_FILES_PATH / Path(path)
             file_path.parent.mkdir(parents=True, exist_ok=True)
